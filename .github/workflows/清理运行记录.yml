@@ -8,7 +8,12 @@ on:
 jobs:
   clean-all:
     runs-on: ubuntu-latest
+    permissions:          # 赋予写入权限以便自动提交空 commit 保活
+      contents: write
     steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4   # 1. 检出代码，保活插件需要本地 Git 环境
+
       - name: Delete old runs across all repos
         uses: actions/github-script@v7
         with:
@@ -115,3 +120,9 @@ jobs:
             }
 
             console.log('\n🎉 所有仓库的历史记录清理完成！');
+
+      - name: Keepalive Workflow
+        uses: gautamkrishnar/keepalive-workflow@v2   # 2. 保活步骤：在第 50 天自动 commit 重置倒计时
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          time_elapsed: 50
