@@ -129,22 +129,29 @@ jobs:
           DAYS_THRESHOLD=50
           CURRENT_TIMESTAMP=$(date +%s)
           
-          # 检查保活文件是否存在
-          if [ -f "$KEEPALIVE_FILE" ]; then
-            LAST_DATE=$(cat "$KEEPALIVE_FILE")
-            # 解析上一次的日期时间戳
-            LAST_TIMESTAMP=$(date -d "$LAST_DATE" +\%s 2>/dev/null \vert{}\vert{} date -j -f "\%Y-\%m-\%d" "$LAST_DATE" +%s 2>/dev/null || echo 0)
+          # 检查保活文件是否存在且非空
+          if [ -s "$KEEPALIVE_FILE" ]; then
+            LAST_DATE=$(tr -d '\r\n' < "$KEEPALIVE_FILE")
+            # 解析时间戳，转换失败时默认设为 0
+            LAST_TIMESTAMP=$(date -d "$LAST_DATE" +%s 2>/dev/null || echo 0)
+            if [ "$LAST_TIMESTAMP" -gt 0 ]; then
+              DIFF_DAYS=$(( (CURRENT_TIMESTAMP - LAST_TIMESTAMP) / 86400 ))
+            else
+              DIFF_DAYS=999
+            fi
           else
-            LAST_TIMESTAMP=0
+            echo "首次运行，未找到保活文件 $KEEPALIVE_FILE"
+            DIFF_DAYS=999
           fi
           
-          # 计算相差天数
-          DIFF_DAYS=$(( (CURRENT_TIMESTAMP - LAST_TIMESTAMP) / 86400 ))
           echo "距离上次保活提交已过去 $DIFF_DAYS 天（设定阈值：$DAYS_THRESHOLD 天）"
           
-          # 超过或等于 50 天（或首次运行）时触发提交
-          if [ $DIFF_DAYS -ge$DAYS_THRESHOLD ]; then
+          # 判空与阈值比较（使用 [[ ]] 增强型语法）
+          if [[ "$DIFF_DAYS" -ge "$DAYS_THRESHOLD" ]]; then
             echo "达到 $DAYS_THRESHOLD 天保活条件，开始更新保活文件..."
+            
+            # 确保 .github 目录存在
+            mkdir -p .github
             date +%Y-%m-%d > "$KEEPALIVE_FILE"
             
             git config --global user.name "github-actions[bot]"
