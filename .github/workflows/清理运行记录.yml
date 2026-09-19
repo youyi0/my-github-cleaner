@@ -1,35 +1,8 @@
-name: '清理运行记录'  # Global Workflow Runs Cleaner
-
-on:
-  schedule:
-    - cron: '0 0 * * *' # 每天凌晨自动清理所有仓库
-  workflow_dispatch:      # 支持手动一键触发清理
-
-jobs:
-  clean-all:
-    runs-on: ubuntu-latest
-    permissions:          # 赋予写入权限以便自动提交保活文件
-      contents: write
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4   # 检出代码
-
-      - name: Delete old runs across all repos
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.MY_GLOBAL_PAT }}
-          script: |
+script: |
             // 保留记录条数
             const keepMinimumRuns = 5;
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-            /* ==============================================================
-             * 【未来恢复 3 天限制】：取消下面 2 行注释即可
-             * ============================================================== */
-            // const daysToKeep = 3;
-            // const cutoff = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
-
-            // 1. 获取当前账号下所有的个人仓库
             const repos = await github.paginate(github.rest.repos.listForAuthenticatedUser, {
               visibility: 'all',
               affiliation: 'owner',
@@ -43,30 +16,18 @@ jobs:
               const repoName = repo.name;
               console.log(`\n🔍 正在检查仓库: ${owner}/${repoName}`);
 
-              // --------------------------------------------------------------
-              // 【清理 Actions 缓存】（释放 Storage 额度的关键）
-              // --------------------------------------------------------------
+              // 【清理 Actions 缓存】
               try {
-                const caches = await github.rest.actions.getActionsCacheList({
-                  owner: owner,
-                  repo: repoName,
-                });
+                const caches = await github.rest.actions.getActionsCacheList({ owner: owner, repo: repoName });
                 if (caches.data.actions_caches && caches.data.actions_caches.length > 0) {
-                  console.log(`  📦 找到 ${caches.data.actions_caches.length} 个缓存，开始清理...`);
                   for (const cache of caches.data.actions_caches) {
-                    await github.rest.actions.deleteActionsCacheById({
-                      owner: owner,
-                      repo: repoName,
-                      cache_id: cache.id,
-                    });
+                    await github.rest.actions.deleteActionsCacheById({ owner: owner, repo: repoName, cache_id: cache.id });
                   }
-                  console.log(`  ✅ 缓存清理完毕！`);
                 }
-              } catch (err) {
-                // 部分仓库可能无缓存或未开启 Actions 权限，直接跳过
-              }
+              } catch (err) {}
 
               let deletedInRepo = 0;
+              let failedIds = new Set(); // 记录本次已经删除失败的 ID，防止死循环
 
               while (true) {
                 let response;
@@ -78,24 +39,18 @@ jobs:
                     page: 1
                   });
                 } catch (err) {
-                  // 如果该仓库没开启 Actions 或权限不足，直接跳过
                   break;
                 }
 
                 const runs = response.data.workflow_runs;
-                if (!runs || runs.length <= keepMinimumRuns) {
+                // 过滤掉已经尝试过但删除失败的记录，防止无限重复触发
+                const runsToDelete = runs ? runs.slice(keepMinimumRuns).filter(run => !failedIds.has(run.id)) : [];
+
+                if (!runs || runs.length <= keepMinimumRuns || runsToDelete.length === 0) {
                   break;
                 }
 
-                // 取设置条数之后的所有旧记录
-                const runsToDelete = runs.slice(keepMinimumRuns);
-
-                /* ==============================================================
-                 * 【未来恢复 3 天限制】：取消下面 2 行注释，并将上面这行注释掉
-                 * ============================================================== */
-                // const runsToDelete = runs.slice(keepMinimumRuns).filter(run => new Date(run.created_at).getTime() < cutoff);
-                // if (runsToDelete.length === 0) break;
-
+                let successCount = 0;
                 for (const run of runsToDelete) {
                   try {
                     await github.rest.actions.deleteWorkflowRun({
@@ -104,62 +59,27 @@ jobs:
                       run_id: run.id
                     });
                     deletedInRepo++;
+                    successCount++;
                     console.log(`  └─ [${deletedInRepo}] 已删除 ID: ${run.id} (${run.name})`);
                     await sleep(200);
                   } catch (err) {
                     console.error(`  └─ 删除失败 ${run.id}:`, err.message);
+                    failedIds.add(run.id); // 标记该 ID 失败，后续循环不再尝试
                   }
+                }
+
+                // 如果这一轮循环没有任何一条成功删除，说明遇到了死锁或顽固记录，直接跳出当前仓库
+                if (successCount === 0) {
+                  console.log(`  ⚠️ 仓库 ${repoName} 存在无法删除的记录，跳过该仓库继续其他仓库。`);
+                  break;
                 }
               }
 
               if (deletedInRepo > 0) {
                 console.log(`✅ 仓库 ${repoName} 清理完成，共删除 ${deletedInRepo} 条记录。`);
               } else {
-                console.log(`✨ 仓库 ${repoName} 记录无需清理（<= ${keepMinimumRuns} 条）。`);
+                console.log(`✨ 仓库 ${repoName} 记录无需清理或已跳过。`);
               }
             }
 
             console.log('\n🎉 所有仓库的历史记录清理完成！');
-
-      - name: Keepalive Workflow (50 天本地文件检测)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          KEEPALIVE_FILE=".github/keepalive.txt"
-          DAYS_THRESHOLD=50
-          CURRENT_TIMESTAMP=$(date +%s)
-          
-          # 检查保活文件是否存在且非空
-          if [ -s "$KEEPALIVE_FILE" ]; then
-            LAST_DATE=$(tr -d '\r\n' < "$KEEPALIVE_FILE")
-            # 解析时间戳，转换失败时默认设为 0
-            LAST_TIMESTAMP=$(date -d "$LAST_DATE" +%s 2>/dev/null || echo 0)
-            if [ "$LAST_TIMESTAMP" -gt 0 ]; then
-              DIFF_DAYS=$(( (CURRENT_TIMESTAMP - LAST_TIMESTAMP) / 86400 ))
-            else
-              DIFF_DAYS=999
-            fi
-          else
-            echo "首次运行，未找到保活文件 $KEEPALIVE_FILE"
-            DIFF_DAYS=999
-          fi
-          
-          echo "距离上次保活提交已过去 $DIFF_DAYS 天（设定阈值：$DAYS_THRESHOLD 天）"
-          
-          # 判空与阈值比较（使用 [[ ]] 增强型语法）
-          if [[ "$DIFF_DAYS" -ge "$DAYS_THRESHOLD" ]]; then
-            echo "达到 $DAYS_THRESHOLD 天保活条件，开始更新保活文件..."
-            
-            # 确保 .github 目录存在
-            mkdir -p .github
-            date +%Y-%m-%d > "$KEEPALIVE_FILE"
-            
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add "$KEEPALIVE_FILE"
-            git commit -m "chore: keepalive workflow update [skip ci]"
-            git push
-            echo "✅ 保活文件已更新并推送！"
-          else
-            echo "未达到保活间隔天数，本次跳过提交。"
-          fi
