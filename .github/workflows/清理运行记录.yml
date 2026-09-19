@@ -30,11 +30,17 @@ jobs:
             // const cutoff = Date.now() - (daysToKeep * 24 * 60 * 60 * 1000);
 
             // 1. 获取当前账号下所有的个人仓库
-            const repos = await github.paginate(github.rest.repos.listForAuthenticatedUser, {
-              visibility: 'all',
-              affiliation: 'owner',
-              per_page: 100
-            });
+            let repos = [];
+            try {
+              repos = await github.paginate(github.rest.repos.listForAuthenticatedUser, {
+                visibility: 'all',
+                affiliation: 'owner',
+                per_page: 100
+              });
+            } catch (err) {
+              console.error('获取仓库列表失败:', err.message);
+              return;
+            }
 
             console.log(`获取到 ${repos.length} 个仓库，开始依次检查与清理...`);
 
@@ -87,15 +93,20 @@ jobs:
                   break;
                 }
 
-                // 取设置条数之后的所有旧记录
-                const runsToDelete = runs.slice(keepMinimumRuns);
+                // 核心修改：只选择状态为已完成（completed）的旧记录，自动跳过正在排队或运行中的任务
+                const runsToDelete = runs.slice(keepMinimumRuns).filter(run => {
+                  const isCompleted = run.status === 'completed';
+                  if (!isCompleted) {
+                    console.log(`  ⏳ 跳过进行中/排队中的任务 ID: ${run.id} (状态: ${run.status})`);
+                  }
+                  return isCompleted;
+                });
 
-                /* ==============================================================
-                 * 【未来恢复 3 天限制】：取消下面 2 行注释，并将上面这行注释掉
-                 * ============================================================== */
-                // const runsToDelete = runs.slice(keepMinimumRuns).filter(run => new Date(run.created_at).getTime() < cutoff);
-                // if (runsToDelete.length === 0) break;
+                if (runsToDelete.length === 0) {
+                  break;
+                }
 
+                let successCount = 0;
                 for (const run of runsToDelete) {
                   try {
                     await github.rest.actions.deleteWorkflowRun({
@@ -104,18 +115,25 @@ jobs:
                       run_id: run.id
                     });
                     deletedInRepo++;
+                    successCount++;
                     console.log(`  └─ [${deletedInRepo}] 已删除 ID: ${run.id} (${run.name})`);
                     await sleep(200);
                   } catch (err) {
                     console.error(`  └─ 删除失败 ${run.id}:`, err.message);
                   }
                 }
+
+                // 如果这一轮循环没有成功删除任何记录，直接跳出当前仓库防止卡死
+                if (successCount === 0) {
+                  console.log(`  ⚠️ 仓库 ${repoName} 存在无法清理的记录，跳过该仓库。`);
+                  break;
+                }
               }
 
               if (deletedInRepo > 0) {
                 console.log(`✅ 仓库 ${repoName} 清理完成，共删除 ${deletedInRepo} 条记录。`);
               } else {
-                console.log(`✨ 仓库 ${repoName} 记录无需清理（<= ${keepMinimumRuns} 条）。`);
+                console.log(`✨ 仓库 ${repoName} 记录无需清理。`);
               }
             }
 
